@@ -641,6 +641,27 @@ CATEGORIES = {
 }
 STATUSES = {"fixed", "needs_user_input", "not_applicable"}
 
+CHANGE_TYPES = {"RESTRUCTURE", "CITATION", "PLACEHOLDER"}
+
+DISCLAIMER_LINE = (
+    "General legal information only — not legal advice. Consult a licensed attorney."
+)
+
+VERIFY_PLACEHOLDER = "[VERIFY: ___]"
+REMOVED_CLAIM = (
+    "[VERIFY: a statement was removed here because it asserted a fact that "
+    "does not appear in your supplied draft. Add it back only if you can "
+    "confirm it yourself.]"
+)
+
+GENERAL_FRAME = (
+    "You are assisting with a legal drafting exercise. Everything you "
+    "produce is GENERAL LEGAL INFORMATION ONLY — you are not a lawyer, "
+    "this is not legal advice, no attorney-client relationship is created, "
+    "and a licensed attorney should review any resulting document before "
+    "it is used. This is a DRAFT exercise; nothing is filed or sent."
+)
+
 GENERAL_FRAME = (
     "You are assisting with a legal drafting exercise. Everything you "
     "produce is GENERAL LEGAL INFORMATION ONLY — you are not a lawyer, "
@@ -747,28 +768,54 @@ def build_harden_prompt(draft_text: str, attack: dict) -> str:
         f"{draft_text}\n\n"
         "ADVERSARY OBJECTIONS:\n"
         f"{objections_block}\n\n"
-        "RULES:\n"
-        "- Never reproduce copyrighted text verbatim; cite published sources "
-        "by name and edition only.\n"
-        "- Do not invent case citations, docket numbers, statutes with "
-        "specific section numbers, or quotations. If an objection can only "
-        "be fixed with a fact or authority the user has not supplied, keep "
-        "the draft as is on that point, mark the hardening status "
-        '"needs_user_input", and say exactly what the user must supply.\n'
-        "- If an objection is genuinely not applicable to the draft, say so "
-        'with status "not_applicable" and a one-sentence reason.\n'
-        "- Keep the revised draft compact: same 4-7 section structure, each "
-        "body 2-5 sentences. Keep each fix_applied note to 1-2 sentences.\n\n"
+        "HARD RULES — NO NEW FACTS. Breaking any of these is a failure:\n"
+        "- You may ONLY do three kinds of change: (a) RESTRUCTURE — "
+        "reorder, reword, or reframe material that is already in the draft "
+        "or the objections; (b) CITATION — add or correct legal citations "
+        "and argument framing; (c) PLACEHOLDER — insert a clearly marked "
+        "placeholder like [VERIFY: what the user must confirm] where an "
+        "objection needs a fact that is NOT in the draft or objections.\n"
+        "- NEVER introduce a factual assertion that does not appear in the "
+        "draft or the objections: no new dates or deadlines, no page, "
+        "document, video, or other counts, no new events, no completed "
+        "actions (nothing 'has been reviewed', 'was served', 'was filed', "
+        "'was mailed', or 'was received' unless the draft already says "
+        "so), no agreements, and no waivers or concessions of any kind.\n"
+        "- NEVER complete a certificate of service: no service method and "
+        "no service date unless it appears verbatim in the draft. If it "
+        "does not, leave a [VERIFY: ...] placeholder and mark the entry "
+        "needs_user_input.\n"
+        "- NEVER add a waiver (for example of speedy-trial time) or any "
+        "other substantive concession, even if an objection suggests one. "
+        "If an objection raises it, use a placeholder and needs_user_input "
+        "so the user decides.\n"
+        "- If an objection can only be fixed with a fact or authority the "
+        "user has not supplied, insert a [VERIFY: ...] placeholder at that "
+        'point in the draft, mark the status "needs_user_input", and say '
+        "exactly what the user must supply.\n"
+        "- Never reproduce copyrighted text verbatim; cite published "
+        "sources by name and edition only. Do not invent case citations, "
+        "docket numbers, statutes with specific section numbers, or "
+        "quotations.\n"
+        "- If an objection is genuinely not applicable to the draft, say "
+        'so with status "not_applicable" and a one-sentence reason; make '
+        "no change for it.\n"
+        "- Keep the revised draft compact: same 4-7 section structure, "
+        "each body 2-5 sentences. Keep each fix_applied note to 1-2 "
+        "sentences.\n\n"
         "Return STRICT JSON with EXACTLY these keys and no others:\n"
-        '"revised_draft" (object with "title" string, "sections" array of '
-        '{"heading","body"} objects, "full_text" string), '
-        '"hardening_report" (array with one entry per objection, each with '
-        '"objection_summary" string, "severity" string, "fix_applied" '
-        'string, "status" one of "fixed"|"needs_user_input"|"not_applicable"). '
-        "No markdown, no code fences, no commentary outside the JSON object."
+        '"revised_draft" (object with "title" string, "sections" array '
+        'of {"heading","body"} objects, "full_text" string), '
+        '"hardening_report" (array with one entry per objection, each '
+        'with "objection_summary" string, "severity" string, '
+        '"fix_applied" string, "status" one of '
+        '"fixed"|"needs_user_input"|"not_applicable", and "change_type" '
+        'one of "RESTRUCTURE"|"CITATION"|"PLACEHOLDER" — PLACEHOLDER '
+        "whenever a [VERIFY: ...] placeholder was inserted, CITATION when "
+        "the change is a citation or legal-framing change, RESTRUCTURE "
+        "otherwise). No markdown, no code fences, no commentary outside "
+        "the JSON object."
     )
-
-
 def _validate_hardened(payload: dict) -> dict:
     revised = payload["revised_draft"]
     if not isinstance(revised, dict):
@@ -804,12 +851,21 @@ def _validate_hardened(payload: dict) -> dict:
                 raise AIServiceError(
                     f"Hardening report entry {i} is missing a string '{key}'."
                 )
+        change_type = r.get("change_type")
+        if change_type not in CHANGE_TYPES:
+            # Tolerate older-shaped responses: derive the only sensible tag.
+            change_type = (
+                "PLACEHOLDER"
+                if r["status"] == "needs_user_input"
+                else "RESTRUCTURE"
+            )
         cleaned.append(
             {
                 "objection_summary": r["objection_summary"],
                 "severity": r["severity"],
                 "fix_applied": r["fix_applied"],
                 "status": r["status"],
+                "change_type": change_type,
             }
         )
     return {
@@ -824,13 +880,321 @@ def _validate_hardened(payload: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Deterministic no-new-facts guard (hardening only).
+#
+# The harden prompt forbids new facts, but a prompt is a request, not an
+# enforcement. This guard runs on every hardened output and removes any
+# concrete specific that does not appear in the inputs:
+#   * dates and quantities (pages, days, counts, money, percents) must
+#     appear in the original draft OR the adversary objections;
+#   * completed-action claims ("has reviewed", "was served"), waiver
+#     claims, and certificate-of-service methods must appear in the
+#     original draft itself — an objection merely raising a topic (e.g.
+#     asking whether the user will waive speedy-trial time) never licenses
+#     writing that claim into the document.
+# Anything unsupported is replaced with a [VERIFY: ...] placeholder and
+# listed in the returned "unverified_additions" so the user can see
+# exactly what was stripped and decide for themselves.
+# ---------------------------------------------------------------------------
+
+_MONTH_NUM = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+    "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+}
+_MONTH_ALT = "|".join(_MONTH_NUM)
+
+_WORD_NUM = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+
+_UNIT_ALT = (
+    r"(?:pages?|videos?|recordings?|documents?|exhibits?|files?|copies|"
+    r"days?|weeks?|months?|years?|hours?|minutes?)"
+)
+_QTY_RE = re.compile(
+    r"\b(\d[\d,]*(?:\.\d+)?|" + "|".join(_WORD_NUM) + r")\s*-?\s*("
+    + _UNIT_ALT + r")\b",
+    re.IGNORECASE,
+)
+_MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d{2})?")
+_PCT_RE = re.compile(r"\b\d+(?:\.\d+)?\s?%")
+
+# Verbs that assert a completed real-world action when used in a
+# perfect/passive construction ("has reviewed", "was served").
+_CLAIM_VERBS = {
+    "reviewed", "read", "examined", "inspected", "served", "filed",
+    "mailed", "emailed", "delivered", "sent", "received", "provided",
+    "submitted", "obtained", "prepared", "signed", "executed",
+}
+_PASSIVE_CLAIM_VERBS = {
+    "served", "mailed", "emailed", "delivered", "filed", "sent",
+    "submitted",
+}
+_ACTIVE_CLAIM_RE = re.compile(
+    r"\b(?:has|have|had)\s+(?:not\s+)?([a-z]+)\b", re.IGNORECASE
+)
+_PASSIVE_CLAIM_RE = re.compile(
+    r"\b(?:was|were|been|be)\s+([a-z]+)\b", re.IGNORECASE
+)
+_WAIVER_RE = re.compile(r"\bwaiv\w*\b", re.IGNORECASE)
+_CERT_RE = re.compile(
+    r"(certificate of service|hereby certify|i certify)", re.IGNORECASE
+)
+_CERT_METHODS = (
+    "electronic mail", "e-mail", "email", "mailed", "mail", "hand-deliver",
+    "hand deliver", "personal delivery", "e-filed", "efiled", "facsimile",
+    "overnight courier",
+)
+
+
+def _bracket_spans(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in re.finditer(r"\[[^\]]*\]", text)]
+
+
+def _in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in spans)
+
+
+def _iter_dates(text: str):
+    """Yield (start, end, md, my, triple) for each date phrase in text.
+
+    md = (month, day); my = (month, year); triple = (month, day, year).
+    Unused components are None.
+    """
+    found = []
+    for m in re.finditer(
+        rf"\b({_MONTH_ALT})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?",
+        text, re.IGNORECASE,
+    ):
+        mon = _MONTH_NUM[m.group(1).lower()]
+        day = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else None
+        found.append((m.start(), m.end(), (mon, day), None,
+                      (mon, day, year) if year else None))
+    for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b", text):
+        mon, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if year < 100:
+            year += 2000
+        found.append((m.start(), m.end(), (mon, day), None, (mon, day, year)))
+    for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
+        year, mon, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        found.append((m.start(), m.end(), (mon, day), None, (mon, day, year)))
+    spans = [(s, e) for s, e, *_ in found]
+    for m in re.finditer(rf"\b({_MONTH_ALT})\s+(\d{{4}})\b", text, re.IGNORECASE):
+        if _in_spans(m.start(), spans):
+            continue
+        mon = _MONTH_NUM[m.group(1).lower()]
+        found.append((m.start(), m.end(), None, (mon, int(m.group(2))), None))
+    return sorted(found)
+
+
+def _qty_key(num_raw: str, unit_raw: str) -> tuple:
+    unit = unit_raw.lower()
+    if unit.endswith("ies"):
+        unit = unit[:-3] + "y"
+    elif unit.endswith("s"):
+        unit = unit[:-1]
+    num_raw = num_raw.lower().replace(",", "")
+    if num_raw in _WORD_NUM:
+        return (_WORD_NUM[num_raw], unit)
+    try:
+        value = float(num_raw)
+    except ValueError:
+        return (num_raw, unit)
+    return (int(value) if value == int(value) else value, unit)
+
+
+def _support_sets(support_text: str, draft_text: str) -> dict:
+    dates = _iter_dates(support_text)
+    return {
+        "date_md": {d[2] for d in dates if d[2]},
+        "date_my": {d[3] for d in dates if d[3]},
+        "date_triple": {d[4] for d in dates if d[4]},
+        "qty": {
+            _qty_key(m.group(1), m.group(2))
+            for m in _QTY_RE.finditer(support_text)
+        },
+        "money": {
+            m.group(0).replace(" ", "").replace(",", "")
+            for m in _MONEY_RE.finditer(support_text)
+        },
+        "pct": {
+            m.group(0).replace(" ", "")
+            for m in _PCT_RE.finditer(support_text)
+        },
+        "draft_claim_verbs": {
+            m.group(1).lower()
+            for m in _ACTIVE_CLAIM_RE.finditer(draft_text)
+            if m.group(1).lower() in _CLAIM_VERBS
+        } | {
+            m.group(1).lower()
+            for m in _PASSIVE_CLAIM_RE.finditer(draft_text)
+            if m.group(1).lower() in _PASSIVE_CLAIM_VERBS
+        },
+        "draft_has_waiver": bool(_WAIVER_RE.search(draft_text)),
+        "draft_lower": draft_text.lower(),
+    }
+
+
+def _guard_phrases(text: str, sup: dict, flags: list[str]) -> str:
+    """Replace unsupported dates/quantities/money/percents with placeholders."""
+    spans = _bracket_spans(text)
+    edits = []  # (start, end, kind, original)
+
+    for start, end, md, my, triple in _iter_dates(text):
+        if _in_spans(start, spans):
+            continue
+        if triple is not None:
+            ok = triple in sup["date_triple"]
+        elif md is not None:
+            ok = md in sup["date_md"]
+        else:
+            ok = my in sup["date_my"]
+        if not ok:
+            edits.append((start, end, "date", text[start:end]))
+
+    for m in _QTY_RE.finditer(text):
+        if _in_spans(m.start(), spans):
+            continue
+        if _qty_key(m.group(1), m.group(2)) not in sup["qty"]:
+            edits.append((m.start(), m.end(), "quantity", m.group(0)))
+
+    for m in _MONEY_RE.finditer(text):
+        if _in_spans(m.start(), spans):
+            continue
+        if m.group(0).replace(" ", "").replace(",", "") not in sup["money"]:
+            edits.append((m.start(), m.end(), "amount", m.group(0)))
+
+    for m in _PCT_RE.finditer(text):
+        if _in_spans(m.start(), spans):
+            continue
+        if m.group(0).replace(" ", "") not in sup["pct"]:
+            edits.append((m.start(), m.end(), "percentage", m.group(0)))
+
+    edits.sort()
+    out, last = [], 0
+    for start, end, kind, original in edits:
+        if start < last:
+            continue
+        out.append(text[last:start])
+        out.append(VERIFY_PLACEHOLDER)
+        flags.append(f"Unsupported {kind} removed: '{original}'")
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _sentence_is_unsupported(sentence: str, sup: dict) -> bool:
+    """True when a sentence asserts a completion/waiver/service claim that
+    the original draft does not contain."""
+    bare = re.sub(r"\[[^\]]*\]", " ", sentence)
+    if _WAIVER_RE.search(bare) and not sup["draft_has_waiver"]:
+        return True
+    for m in _ACTIVE_CLAIM_RE.finditer(bare):
+        verb = m.group(1).lower()
+        if verb in _CLAIM_VERBS and verb not in sup["draft_claim_verbs"]:
+            return True
+    for m in _PASSIVE_CLAIM_RE.finditer(bare):
+        verb = m.group(1).lower()
+        if verb in _PASSIVE_CLAIM_VERBS and verb not in sup["draft_claim_verbs"]:
+            return True
+    if _CERT_RE.search(bare):
+        low = bare.lower()
+        for method in _CERT_METHODS:
+            if method in low and method not in sup["draft_lower"]:
+                return True
+    return False
+
+
+def _guard_sentences(text: str, sup: dict, flags: list[str]) -> str:
+    lines = []
+    for line in text.split("\n"):
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        kept = []
+        for part in parts:
+            if part.strip() and _sentence_is_unsupported(part, sup):
+                flags.append(
+                    "Unsupported claim removed: '"
+                    + (part.strip()[:140] + ("..." if len(part.strip()) > 140 else ""))
+                    + "'"
+                )
+                kept.append(REMOVED_CLAIM)
+            else:
+                kept.append(part)
+        lines.append(" ".join(kept))
+    return "\n".join(lines)
+
+
+def guard_unverified_specifics(
+    revised_draft: dict, hardening_report: list, draft_text: str, attack: dict
+) -> tuple[dict, list, list[str]]:
+    """Strip every concrete specific in the hardened output that the inputs
+    do not support. Returns (revised_draft, hardening_report, flags)."""
+    objections_text = "\n".join(
+        f"{o.get('objection', '')} {o.get('argument', '')}"
+        for o in attack.get("objections", [])
+        if isinstance(o, dict)
+    )
+    sup = _support_sets(draft_text + "\n" + objections_text, draft_text)
+    flags: list[str] = []
+
+    def clean(text: str) -> str:
+        return _guard_sentences(_guard_phrases(text, sup, flags), sup, flags)
+
+    revised = {
+        "title": revised_draft.get("title", ""),
+        "sections": [
+            {"heading": s.get("heading", ""), "body": clean(s.get("body", ""))}
+            for s in revised_draft.get("sections", [])
+        ],
+        "full_text": clean(revised_draft.get("full_text", "")),
+    }
+    if DISCLAIMER_LINE not in revised["full_text"]:
+        revised["full_text"] = (
+            revised["full_text"].rstrip() + "\n\n" + DISCLAIMER_LINE
+        )
+
+    report = []
+    for entry in hardening_report:
+        entry = dict(entry)
+        if entry.get("fix_applied"):
+            entry["fix_applied"] = clean(entry["fix_applied"])
+        report.append(entry)
+
+    # De-duplicate flags, preserving order.
+    seen, unique = set(), []
+    for flag in flags:
+        if flag not in seen:
+            seen.add(flag)
+            unique.append(flag)
+    return revised, report, unique
+
+
 def harden_draft(
     draft_text: str, attack: dict, model: str | None = None
 ) -> dict:
-    """Revise a draft against an attack; returns revised_draft + hardening_report."""
+    """Revise a draft against an attack; returns revised_draft +
+    hardening_report + unverified_additions (specifics the guard stripped
+    because the inputs did not support them)."""
     prompt = build_harden_prompt(draft_text, attack)
     raw = run_prompt(prompt, model=resolve_model(model))
-    return _validate_hardened(parse_json_response(raw, REVISED_KEYS, "hardening"))
+    result = _validate_hardened(parse_json_response(raw, REVISED_KEYS, "hardening"))
+    revised, report, flags = guard_unverified_specifics(
+        result["revised_draft"], result["hardening_report"], draft_text, attack
+    )
+    return {
+        "revised_draft": revised,
+        "hardening_report": report,
+        "unverified_additions": flags,
+    }
+
 
 # ============================================================
 # module: main.py (flattened)
@@ -1148,6 +1512,7 @@ async def adversary_harden(request: Request) -> dict:
     except AdversaryError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+    unverified = result.get("unverified_additions", [])
     add_event(
         session,
         "harden",
@@ -1155,6 +1520,7 @@ async def adversary_harden(request: Request) -> dict:
         {
             "revised_draft": result["revised_draft"],
             "hardening_report": result["hardening_report"],
+            "unverified_additions": unverified,
         },
     )
 
@@ -1163,5 +1529,6 @@ async def adversary_harden(request: Request) -> dict:
         "round": session["round"],
         "revised_draft": result["revised_draft"],
         "hardening_report": result["hardening_report"],
+        "unverified_additions": unverified,
         "disclaimer": DISCLAIMER,
     }
