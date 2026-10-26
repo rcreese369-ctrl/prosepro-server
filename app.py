@@ -547,6 +547,25 @@ def build_draft_prompt(
         "specific section numbers, or quotations from authorities. If a "
         "point needs authority the user has not supplied, mark it "
         "needs_user_input instead of inventing one.\n"
+        "- CARRY KNOWN FACTS VERBATIM: any case or cause number, caption "
+        "(the court name and the party names as styled in the source), "
+        "court, and party names that appear in the ANALYSIS above or in "
+        "the USER-SUPPLIED FACTS must be carried into the draft exactly "
+        "as given. Never ask the user for a fact that already appears in "
+        "the analysis or the user-supplied facts, and never list such a "
+        "fact in needs_user_input.\n"
+        "- Open full_text with a caption block: the court, the party "
+        "names as styled in the source, and the case/cause number "
+        "verbatim when one appears in the inputs. Only if no case/cause "
+        "number appears anywhere in the inputs, put a marker like "
+        "[USER INPUT NEEDED: case/cause number] in the caption and list "
+        "it ONCE in needs_user_input.\n"
+        "- ADDRESS THE FIRST FLAGGED WEAKNESS: the draft must deal with "
+        "the first item in the analysis Weaknesses list — cure it, "
+        "concede and excuse it, or argue around it in the body. If it "
+        "cannot be addressed with the facts supplied, add ONE entry to "
+        "needs_user_input explaining exactly what is needed and why; "
+        "never silently ignore it.\n"
         "- Where a fact needed for the draft is missing, write a visible "
         "marker in the body like [USER INPUT NEEDED: describe the missing "
         "fact] and list each missing fact in needs_user_input.\n"
@@ -559,6 +578,42 @@ def build_draft_prompt(
         'of strings, empty array if nothing is missing). No markdown, no '
         "code fences, no commentary outside the JSON object."
     )
+
+
+_CASE_NUMBER_RE = re.compile(
+    r"\b(?:case|cause)\s*(?:number|no\.?|#)\b", re.IGNORECASE
+)
+_CAPTION_SUFFIX_RE = re.compile(
+    r"\s+(?:for|in)\s+(?:the\s+)?caption$", re.IGNORECASE
+)
+
+
+def _need_key(text: str) -> str:
+    """Canonical key for de-duplicating needs_user_input entries (D3).
+
+    Normalizes case, whitespace and trailing punctuation, and collapses
+    the case-number synonym family ("case number", "cause number",
+    "case no.", "cause no", ...) into one canonical item — so the user
+    is never asked twice for the same fact.
+    """
+    key = re.sub(r"\s+", " ", text.strip().lower()).strip(" .")
+    key = _CASE_NUMBER_RE.sub("case/cause number", key)
+    key = _CAPTION_SUFFIX_RE.sub("", key)
+    return key.strip(" .")
+
+
+def _dedupe_needs(needs: list[str]) -> list[str]:
+    """Drop duplicate needs_user_input entries, keeping first-seen order
+    and the first entry's original wording."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in needs:
+        key = _need_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 def _validate_draft(payload: dict) -> dict:
@@ -586,7 +641,7 @@ def _validate_draft(payload: dict) -> dict:
             {"heading": s["heading"], "body": s["body"]} for s in sections
         ],
         "full_text": payload["full_text"],
-        "needs_user_input": needs,
+        "needs_user_input": _dedupe_needs(needs),
     }
 
 
@@ -1427,9 +1482,20 @@ async def adversary_round(request: Request) -> dict:
     """Run one adversary attack round against a draft.
 
     Body: {session_id, draft_text, adversary_role, jurisdiction_state,
-           court, model?}
+           court, model?, request_id?}
     Rounds increment from the session's current round; exceeding
     MAX_ADVERSARY_ROUNDS (10) returns 400.
+
+    Idempotency (defect D2): when the client supplies a request_id, it is
+    persisted with the attack event. A retry carrying the same request_id
+    returns the stored response verbatim — no new round is consumed and
+    the model is not called again — so a response lost in transit no
+    longer silently burns a round (or a credit). No request_id keeps the
+    legacy behavior.
+    CLIENT NOTE: the Android client should generate one stable request_id
+    (e.g. a UUID) per user tap on "run adversary round" and reuse that
+    same id on any retry of that tap. (Client change tracked separately;
+    this server side is backward compatible.)
     """
     body = await _json_body(request)
     session_id = _require_str(body, "session_id")
@@ -1438,8 +1504,24 @@ async def adversary_round(request: Request) -> dict:
     jurisdiction_state = _require_str(body, "jurisdiction_state")
     court = _require_str(body, "court")
     model = _optional_str(body, "model")
+    request_id = _optional_str(body, "request_id")
+    if request_id is not None:
+        request_id = request_id.strip() or None
 
     session = get_or_create(session_id)
+
+    if request_id:
+        for event in session.get("events", []):
+            if event.get("type") != "attack":
+                continue
+            if (event.get("data") or {}).get("request_id") == request_id:
+                return {
+                    "session_id": session["session_id"],
+                    "round": event["round"],
+                    "attack": event["data"]["attack"],
+                    "disclaimer": DISCLAIMER,
+                }
+
     next_round = session["round"] + 1
     if next_round > MAX_ADVERSARY_ROUNDS:
         raise HTTPException(
@@ -1464,7 +1546,11 @@ async def adversary_round(request: Request) -> dict:
         session,
         "attack",
         next_round,
-        {"adversary_role": adversary_role, "attack": attack},
+        {
+            "adversary_role": adversary_role,
+            "attack": attack,
+            "request_id": request_id,
+        },
     )
 
     return {
